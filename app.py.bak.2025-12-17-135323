@@ -1,0 +1,145 @@
+import os, time
+from datetime import datetime, timedelta, timezone
+import requests
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+from pydo import Client
+
+load_dotenv()
+
+OPS_MONITOR_BASE_URL = os.getenv("OPS_MONITOR_BASE_URL", "http://127.0.0.1:4000")
+OPS_MONITOR_TOKEN = os.getenv("OPS_MONITOR_TOKEN", "")
+DO_TOKEN = os.getenv("DO_TOKEN", "")
+DO_DROPLET_ID = os.getenv("DO_DROPLET_ID", "")
+RANGE_HOURS = int(os.getenv("RANGE_HOURS", "6"))
+
+st.set_page_config(page_title="Delib Monitoring Dashboard", layout="wide")
+
+def ops_get(path: str, params=None):
+    headers = {}
+    if OPS_MONITOR_TOKEN:
+        headers["x-dashboard-token"] = OPS_MONITOR_TOKEN
+    url = f"{OPS_MONITOR_BASE_URL}{path}"
+    return requests.get(url, headers=headers, params=params, timeout=5)
+
+def to_epoch(dt: datetime) -> int:
+    return int(dt.timestamp())
+
+def do_client():
+    if not DO_TOKEN:
+        return None
+    return Client(token=DO_TOKEN)
+
+def fetch_do_metric(endpoint_func, host_id: str, start: int, end: int):
+    """
+    endpoint_func is something like: client.monitoring.get_droplet_load1_metrics
+    Response shape is Prometheus-like:
+      data.result = list of series, each series has values [[ts, value], ...]
+    """
+    resp = endpoint_func(host_id=host_id, start=str(start), end=str(end))
+    return resp
+
+def series_to_df(resp):
+    data = resp.get("data", {})
+    result = data.get("result", [])
+    rows = []
+    for s in result:
+        metric = s.get("metric", {})
+        values = s.get("values", [])
+        for ts, val in values:
+            rows.append({
+                "time": datetime.fromtimestamp(float(ts), tz=timezone.utc),
+                "value": float(val),
+                "metric": str(metric),
+            })
+    if not rows:
+        return pd.DataFrame(columns=["time","value","metric"])
+    df = pd.DataFrame(rows).sort_values("time")
+    return df
+
+st.title("Deliberatorium — Monitoring & Notifications")
+st.caption("Status + recent logs from delib-ops-monitor, and infra metrics from DigitalOcean Monitoring API.")
+
+colA, colB = st.columns([1,1])
+
+with colA:
+    st.subheader("Component status (from delib-ops-monitor)")
+    try:
+        summary = ops_get("/dashboard/summary").json()
+        comps = summary.get("components", {})
+        st.json(comps)
+    except Exception as e:
+        st.error(f"Failed to fetch /dashboard/summary: {e}")
+
+with colB:
+    st.subheader("Recent logs (from delib-ops-monitor)")
+    try:
+        logs = ops_get("/dashboard/logs", params={"limit": 50}).json().get("logs", [])
+        if logs:
+            df_logs = pd.DataFrame(logs)
+            st.dataframe(df_logs.sort_values("ts", ascending=False), use_container_width=True, height=320)
+        else:
+            st.info("No logs received yet.")
+    except Exception as e:
+        st.error(f"Failed to fetch /dashboard/logs: {e}")
+
+st.divider()
+st.subheader("DigitalOcean Droplet metrics")
+
+if not DO_TOKEN or not DO_DROPLET_ID:
+    st.warning("Set DO_TOKEN and DO_DROPLET_ID in .env to show CPU/RAM charts.")
+else:
+    client = do_client()
+    now = datetime.now(timezone.utc)
+    start_dt = now - timedelta(hours=RANGE_HOURS)
+    start = to_epoch(start_dt)
+    end = to_epoch(now)
+
+    mcol1, mcol2 = st.columns(2)
+
+    with mcol1:
+        st.markdown("### Load average (1m)")
+        try:
+            resp = fetch_do_metric(client.monitoring.get_droplet_load1_metrics, DO_DROPLET_ID, start, end)
+            df = series_to_df(resp)
+            if df.empty:
+                st.info("No load1 data yet (check do-agent + token permissions).")
+            else:
+                chart = df.set_index("time")[["value"]]
+                st.line_chart(chart)
+        except Exception as e:
+            st.error(f"Load1 error: {e}")
+
+    with mcol2:
+        st.markdown("### Memory (available vs total)")
+        try:
+            resp_av = fetch_do_metric(client.monitoring.get_droplet_memory_available_metrics, DO_DROPLET_ID, start, end)
+            resp_total = fetch_do_metric(client.monitoring.get_droplet_memory_total_metrics, DO_DROPLET_ID, start, end)
+
+            df_av = series_to_df(resp_av).rename(columns={"value":"available"})
+            df_total = series_to_df(resp_total).rename(columns={"value":"total"})
+
+            if df_av.empty or df_total.empty:
+                st.info("No memory data yet (check do-agent + token permissions).")
+            else:
+                dfm = pd.merge_asof(
+                    df_av.sort_values("time"),
+                    df_total.sort_values("time"),
+                    on="time",
+                    direction="nearest"
+                )
+                dfm["used_pct"] = 1.0 - (dfm["available"] / dfm["total"])
+                st.line_chart(dfm.set_index("time")[["used_pct"]])
+                st.caption("Note: used_pct is computed from available/total (approx).")
+        except Exception as e:
+            st.error(f"Memory error: {e}")
+
+st.divider()
+st.markdown("#### Notes")
+st.markdown(
+"""
+- Teams notifications: handled by **delib-ops-monitor** (your Node agent).
+- DigitalOcean Control Panel alerts are email/Slack by default; for Teams you usually bridge via email → Teams connector or Power Automate.
+"""
+)

@@ -1,0 +1,237 @@
+import os, json, time
+from datetime import datetime, timedelta, timezone
+
+import requests
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+
+st.set_page_config(page_title="Delib Monitoring Dashboard", layout="wide")
+
+OPS_MONITOR_BASE_URL = os.getenv("OPS_MONITOR_BASE_URL", "http://127.0.0.1:4000").strip().rstrip("/")
+OPS_MONITOR_TOKEN = os.getenv("OPS_MONITOR_TOKEN", "").strip()
+
+DO_TOKEN = os.getenv("DO_TOKEN", "").strip()
+RANGE_HOURS = int(os.getenv("RANGE_HOURS", "6").strip() or "6")
+
+SERVICES_JSON_RAW = os.getenv("SERVICES_JSON", "[]").strip()
+try:
+    SERVICES = json.loads(SERVICES_JSON_RAW) if SERVICES_JSON_RAW else []
+except Exception:
+    SERVICES = []
+
+# ---------- Styling ----------
+st.markdown(
+    """
+<style>
+.small { font-size: 12px; opacity: 0.8; }
+.card {
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 14px;
+  padding: 14px 16px;
+  background: rgba(255,255,255,0.03);
+}
+.ok { color: #2ecc71; font-weight: 700; }
+.bad { color: #e74c3c; font-weight: 700; }
+.warn { color: #f1c40f; font-weight: 700; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+hr { opacity: 0.2; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------- Helpers ----------
+def _ops_headers():
+    h = {"Accept": "application/json"}
+    if OPS_MONITOR_TOKEN:
+        h["x-dashboard-token"] = OPS_MONITOR_TOKEN
+    return h
+
+@st.cache_data(ttl=10)
+def ops_get(path: str):
+    url = f"{OPS_MONITOR_BASE_URL}{path}"
+    r = requests.get(url, headers=_ops_headers(), timeout=8)
+    r.raise_for_status()
+    return r.json()
+
+def _do_headers():
+    if not DO_TOKEN:
+        return None
+    return {"Authorization": f"Bearer {DO_TOKEN}"}
+
+def _parse_matrix_values(payload):
+    """
+    DO metrics API returns:
+    {"data":{"result":[{"values":[[ts,"val"], ...]}]}}
+    """
+    try:
+        result = payload.get("data", {}).get("result", [])
+        if not result:
+            return pd.DataFrame(columns=["ts", "value"])
+        values = result[0].get("values", [])
+        rows = []
+        for ts, val in values:
+            rows.append((datetime.fromtimestamp(int(ts), tz=timezone.utc), float(val)))
+        df = pd.DataFrame(rows, columns=["ts", "value"])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["ts", "value"])
+
+@st.cache_data(ttl=30)
+def do_metric(metric: str, droplet_id: str, hours: int):
+    if not DO_TOKEN or not droplet_id:
+        return pd.DataFrame(columns=["ts", "value"])
+    end = int(time.time())
+    start = int(end - hours * 3600)
+    url = f"https://api.digitalocean.com/v2/monitoring/metrics/droplet/{metric}?host_id={droplet_id}&start={start}&end={end}"
+    r = requests.get(url, headers=_do_headers(), timeout=12)
+    r.raise_for_status()
+    return _parse_matrix_values(r.json())
+
+def compute_mem_used_pct(droplet_id: str, hours: int):
+    avail = do_metric("memory_available", droplet_id, hours)
+    total = do_metric("memory_total", droplet_id, hours)
+    if avail.empty or total.empty:
+        return pd.DataFrame(columns=["ts", "value"])
+    df = pd.merge(avail, total, on="ts", suffixes=("_avail", "_total"))
+    df["value"] = (1.0 - (df["value_avail"] / df["value_total"])) * 100.0
+    return df[["ts", "value"]]
+
+def status_badge(status: str):
+    s = (status or "unknown").lower()
+    if s == "up":
+        return '<span class="ok">UP</span>'
+    if s == "down":
+        return '<span class="bad">DOWN</span>'
+    return '<span class="warn">UNKNOWN</span>'
+
+# ---------- Header ----------
+left, right = st.columns([3, 1])
+with left:
+    st.title("Deliberatorium Monitoring Dashboard")
+    st.markdown(f"<span class='small'>Agent API: <span class='mono'>{OPS_MONITOR_BASE_URL}</span></span>", unsafe_allow_html=True)
+with right:
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("**Controls**")
+    hours = st.slider("Range (hours)", 1, 24, RANGE_HOURS, 1)
+    if st.button("Refresh now"):
+        st.cache_data.clear()
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.divider()
+
+# ---------- Summary from Node agent ----------
+summary = None
+try:
+    summary = ops_get("/dashboard/summary")
+except Exception as e:
+    st.error(f"Cannot reach monitoring agent: {e}")
+    st.stop()
+
+components = summary.get("components", {}) if isinstance(summary, dict) else {}
+
+# ---------- Status cards ----------
+st.subheader("Service Status")
+cols = st.columns(len(SERVICES) if SERVICES else 1)
+
+if not SERVICES:
+    st.warning("SERVICES_JSON is empty. Add your services in .env (Frontend/Backend/Dev).")
+else:
+    for i, svc in enumerate(SERVICES):
+        key = svc.get("key")
+        label = svc.get("label", key)
+        url = svc.get("url")
+        droplet_id = svc.get("droplet_id", "")
+
+        comp = components.get(key, {})
+        stt = comp.get("status", "unknown")
+        last_check = comp.get("lastCheckAt")
+        last_ok = comp.get("lastOkAt")
+        last_err = comp.get("lastError")
+
+        with cols[i]:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown(f"**{label}**")
+            st.markdown(f"Status: {status_badge(stt)}", unsafe_allow_html=True)
+            st.markdown(f"<span class='small'>URL: <span class='mono'>{url}</span></span>", unsafe_allow_html=True)
+            st.markdown(f"<span class='small'>Droplet: <span class='mono'>{droplet_id}</span></span>", unsafe_allow_html=True)
+            if last_check:
+                st.markdown(f"<span class='small'>Last check: <span class='mono'>{last_check}</span></span>", unsafe_allow_html=True)
+            if last_ok:
+                st.markdown(f"<span class='small'>Last OK: <span class='mono'>{last_ok}</span></span>", unsafe_allow_html=True)
+            if last_err:
+                st.markdown(f"<span class='small'>Last error: <span class='mono'>{last_err}</span></span>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+st.divider()
+
+# ---------- Metrics ----------
+st.subheader("CPU & Memory (DigitalOcean)")
+if not DO_TOKEN:
+    st.warning("DO_TOKEN is missing in .env, so CPU/RAM charts are disabled.")
+else:
+    for svc in SERVICES:
+        label = svc.get("label", svc.get("key"))
+        droplet_id = svc.get("droplet_id", "")
+        if not droplet_id:
+            continue
+
+        st.markdown(f"### {label}")
+        c1, c2 = st.columns(2)
+
+        # CPU
+        with c1:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown("**CPU**")
+            try:
+                cpu = do_metric("cpu", droplet_id, hours)
+                if cpu.empty:
+                    st.warning("No CPU data returned from DO for this droplet.")
+                else:
+                    cpu = cpu.set_index("ts")
+                    st.line_chart(cpu["value"])
+                    st.caption("CPU metric from DigitalOcean monitoring API.")
+            except Exception as e:
+                st.error(f"CPU error: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        # Memory used %
+        with c2:
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.markdown("**Memory Used (%)**")
+            try:
+                mem = compute_mem_used_pct(droplet_id, hours)
+                if mem.empty:
+                    st.warning("No memory data returned from DO for this droplet.")
+                else:
+                    mem = mem.set_index("ts")
+                    st.line_chart(mem["value"])
+                    st.caption("Computed from memory_total + memory_available.")
+            except Exception as e:
+                st.error(f"Memory error: {e}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.divider()
+
+# ---------- Logs (from Node agent memory) ----------
+st.subheader("Recent Logs (from monitoring agent)")
+try:
+    logs_payload = ops_get("/dashboard/logs?limit=50")
+    logs = logs_payload.get("logs", [])
+except Exception:
+    logs = []
+
+if not logs:
+    st.info("No logs received yet (send logs to /logs to populate).")
+else:
+    df = pd.DataFrame(logs)
+    # show newest first
+    if "ts" in df.columns:
+        df = df.sort_values("ts", ascending=False)
+    st.dataframe(df, use_container_width=True, height=320)
+
+st.caption("Tip: send a test log: curl -s http://127.0.0.1:4000/logs -H 'Content-Type: application/json' -d '{\"source\":\"test\",\"level\":\"info\",\"message\":\"hello\"}'")
